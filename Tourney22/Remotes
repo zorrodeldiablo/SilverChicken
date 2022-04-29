@@ -1,0 +1,189 @@
+
+   <#
+ .SYNOPSIS
+    Show remote connected users. 
+ .DESCRIPTION 
+    A command to show remote connected users using PowerShell remoting. Include both traditional connections and ssh.
+        The output should show the user name, when they connected, how long connected, and if possible their source IP address.
+ .PARAMETER PLACEHOLDER
+ 
+ .PARAMETER PLACEHOLDER
+ 
+ .EXAMPLE PLACEHOLDER
+
+ .EXAMPLE PLACEHOLDER
+
+ .INPUTS PLACEHOLDER
+
+ .OUTPUTS PLACEHOLDER
+
+ .NOTES PLACEHOLDER
+ #>
+Function Get-PSRemoteSessionUser {
+    [cmdletbinding(DefaultParameterSetName = "ComputerName")]
+    Param(
+        [Parameter(ParameterSetName = 'Session', Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [System.Management.Automation.Runspaces.PSSession[]]$Session,
+
+        [Parameter(ParameterSetName = 'ComputerName', Mandatory, Position = 0)]
+        [Alias('Cn')]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$ComputerName,
+
+        [Parameter(ParameterSetName = 'ComputerName', ValueFromPipelineByPropertyName)]
+        [pscredential]$Credential,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [System.Management.Automation.Runspaces.AuthenticationMechanism]$Authentication,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter(ParameterSetName = 'Session')]
+        [int]$ThrottleLimit
+    )
+
+    Begin {
+        Write-Verbose "[BEGIN  ] Starting: $($MyInvocation.Mycommand)"
+        #define the scriptblock to run remotely
+
+        $run = {
+            $VerbosePreference = $using:VerbosePreference
+            Write-Verbose "[$([environment]::machinename)] Querying for local WSMan sessions"
+            $process = 'wsmprovhost'
+
+            #these helper functions will be used to get and format connection data
+            Function _enumWsMan {
+                [cmdletbinding()]
+                Param()
+
+                Get-WSManInstance -ResourceURI Shell -Enumerate |
+                    Select-Object -Property Name, State, ShellID, Owner, ClientIP, ProcessID,
+                    @{Name = "Memory"; Expression = { _parseMemoryString $_.memoryUsed } },
+                    @{Name = "ShellRunTime"; Expression = { [System.Xml.XmlConvert]::ToTimeSpan($_.ShellRunTime) } },
+                    @{Name = "ShellInactivity"; Expression = { [System.Xml.XmlConvert]::ToTimeSpan($_.ShellInactivity) } },
+                    @{Name = "MaxIdleTimeout"; Expression = { [System.Xml.XmlConvert]::ToTimeSpan($_.MaxIdleTimeout) } },
+                    @{Name = "SessionConfiguration"; Expression = { Split-Path -path $_.resourceuri -leaf } }
+
+            }
+            Function _parseMemoryString {
+                #convert values like 11MB to 11534336
+                [cmdletbinding()]
+                Param([string]$StringValue)
+
+                switch -Regex ($StringValue ) {
+                    "\d+KB" {
+                        $val = 1KB
+                    }
+                    "\d+MB" {
+                        $val = 1MB
+                    }
+                    "\d+GB" {
+                        $val = 1GB
+                    }
+
+                } #switch
+                if ($val) {
+                    [int]$i = ([regex]"\d+").Match($StringValue).value
+                    $i * $val
+                }
+                else {
+                    Write-Warning "Failed to parse $StringValue"
+                    $stringValue
+                }
+
+            } #close function
+
+            try {
+                Write-Verbose "[$([environment]::machinename)] Getting $process process excluding id $PID"
+                $p = (Get-Process -Name $process -IncludeUserName -erroraction stop).where({ $_.id -ne $pid })
+            }
+            Catch [Microsoft.PowerShell.Commands.ProcessCommandException] {
+                Write-Warning "Could not find process $process on this computer."
+            }
+            Catch {
+                Throw $_
+            }
+
+            if ($p) {
+
+                foreach ($item in $p) {
+
+                    if ($item.username) {
+                        Write-Verbose "[$([environment]::machinename)] Getting the SID for $($item.username)"
+                        $SID = [System.Security.Principal.NTAccount]::new("$($item.username)").Translate([System.Security.Principal.SecurityIdentifier]).value
+                    }
+                    else {
+                        $SID = $null
+                    }
+                    #call a private function to enumerate WSMan connection associated with this process ID
+                    Write-Verbose "[$([environment]::machinename)] Enumerating WSMan connections"
+                    $connData = $(_enumWsMan).where({ $_.processid -eq $item.ID })
+
+                    #get child process IDs
+                    Write-Verbose "[$([environment]::machinename)] Getting child processes for id $($item.id)"
+                    $childProcs = (Get-CimInstance -ClassName win32_process -filter "ParentProcessId = $($item.id)" -Property ProcessID).ProcessID
+
+                    #resolve the hostname
+                    #temporarily disable Verbose to eliminate verbose messages from loading the DNSClient module
+                    $VerbosePreference = "SilentlyContinue"
+                    Import-Module DNSClient
+                    $VerbosePreference = $using:VerbosePreference
+                    Try {
+                        Write-Verbose "[$([environment]::machinename)] Resolving the hostname for $($conndata.ClientIP)"
+                        $rHost = (Resolve-DnsName -Name $connData.ClientIP -ErrorAction Stop).NameHost
+                    }
+                    Catch {
+                        Write-Verbose "[$([environment]::machinename)] Failed to resolve a hostname for $($connData.ClientIP)."
+                        $rHost = $connData.clientIP
+                    }
+                     Write-Verbose "[$([environment]::machinename)] Returning connection data"
+                    #Send data back to the host to construct a custom object
+                    @{
+                        rHost        = $rHost
+                        Item         = $item
+                        SID          = $SID
+                        Computername = [environment]::MachineName
+                        ChildProcs   = $childProcs
+                        ConnData     = $connData
+                    }
+
+                } #foreach item
+            }
+            else {
+                Write-Verbose "[$([environment]::machinename)] No running $process process(e$as) found"
+            }
+        } #close scriptblock
+
+        $PSBoundParameters.add("Scriptblock", $Run)
+        $PSBoundParameters.Add("HideComputername", $True)
+    } #begin
+
+    Process {
+        Write-Verbose "[PROCESS] Getting remote connection data"
+        $data = Invoke-Command @PSBoundParameters
+        foreach ($result in $data) {
+            Write-Verbose "[PROCESS] Processing data for $($result.computername)"
+            [pscustomobject]@{
+                PSTypename           = "PSRemoteSessionUser"
+                Computername         = $result.Computername
+                DateUTC              = (Get-Date).ToUniversalTime()
+                StartTimeUTC         = $result.item.StartTime.ToUniversalTime()
+                ProcessID            = $result.item.id
+                ChildProcesses       = $result.childProcs
+                Username             = $result.item.Username
+                SID                  = $result.sid
+                State                = $result.connData.State
+                RemoteHost           = $result.rHost
+                RemoteIPAddress      = $result.connData.ClientIP
+                ShellRunTime         = $result.conndata.ShellRunTime
+                SessionConfiguration = $result.connData.SessionConfiguration
+                Memory               = $result.connData.Memory
+            }
+        } #foreach result
+    } #process
+
+    End {
+        Write-Verbose "[END    ] Ending: $($MyInvocation.Mycommand)"
+    } #end
+
+} #close Get-RemoteSessionUser
